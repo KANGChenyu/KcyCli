@@ -1,0 +1,137 @@
+package com.paicli.memory;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * 记忆检索器 - 根据查询从长期记忆中检索最相关的信息。
+ *
+ * 检索策略：
+ * 1. 关键词匹配：直接匹配内容中的关键词
+ * 2. 类型优先：不同场景优先检索不同类型的记忆
+ * 3. 时间衰减：越近的记忆权重越高
+ */
+public class MemoryRetriever {
+    private final LongTermMemory longTermMemory;
+
+    public MemoryRetriever(LongTermMemory longTermMemory) {
+        this.longTermMemory = longTermMemory;
+    }
+
+    /**
+     * 检索与查询最相关的记忆
+     *
+     * @param query 查询文本
+     * @param limit 返回条数上限
+     * @return 按相关度排序的记忆列表
+     */
+    public List<MemoryEntry> retrieve(String query, int limit) {
+        return retrieveLongTerm(query, limit);
+    }
+
+    /**
+     * 仅从长期记忆中检索稳定事实，用于 system prompt 注入。
+     *
+     * 当前轮用户输入和短期对话已经在 message history 里，不应再次以"相关记忆"身份
+     * 注入给模型，否则容易让模型把当前请求误读成历史事实。
+     */
+    public List<MemoryEntry> retrieveLongTerm(String query, int limit) {
+        return retrieveLongTerm(query, limit, null);
+    }
+
+    public List<MemoryEntry> retrieveLongTerm(String query, int limit, String projectKey) {
+        String retrievalQuery = expandLongTermQuery(query);
+        return longTermMemory.getAll().stream()
+                .filter(entry -> LongTermMemory.isVisibleInProject(entry, projectKey))
+                .map(entry -> new ScoredEntry(entry, computeRelevanceScore(entry, retrievalQuery) * 1.2, false))
+                .filter(scoredEntry -> scoredEntry.score() > 0)
+                .sorted(Comparator.comparingDouble(ScoredEntry::score).reversed())
+                .limit(limit)
+                .map(ScoredEntry::entry)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 构建上下文：将相关记忆组装成文本，用于注入到 LLM 的 system prompt 中
+     */
+    public String buildContextForQuery(String query, int maxTokens) {
+        return buildContextForQuery(query, maxTokens, null);
+    }
+
+    public String buildContextForQuery(String query, int maxTokens, String projectKey) {
+        List<MemoryEntry> relevant = retrieveLongTerm(query, 10, projectKey);
+        if (relevant.isEmpty()) return "";
+
+        StringBuilder context = new StringBuilder();
+        context.append("## 相关长期记忆\n\n");
+
+        int usedTokens = 0;
+        for (MemoryEntry entry : relevant) {
+            if (usedTokens + entry.getTokenCount() > maxTokens) break;
+
+            context.append("- [").append(entry.getType()).append("] ")
+                    .append(entry.getContent()).append("\n");
+            usedTokens += entry.getTokenCount();
+        }
+
+        context.append("\n");
+        return context.toString();
+    }
+
+    /**
+     * 计算记忆条目与查询的相关度分数
+     */
+    private double computeRelevanceScore(MemoryEntry entry, String query) {
+        String contentLower = entry.getContent().toLowerCase();
+        String queryLower = query.toLowerCase();
+
+        // 1. 精确匹配加分
+        if (contentLower.contains(queryLower)) {
+            return 1.0;
+        }
+
+        // 2. 关键词匹配
+        Set<String> queryWords = MemoryQueryTokenizer.tokenize(queryLower);
+        int matchedWords = 0;
+        for (String word : queryWords) {
+            if (!word.isEmpty() && contentLower.contains(word)) {
+                matchedWords++;
+            }
+        }
+
+        if (matchedWords == 0) return 0;
+
+        double keywordScore = (double) matchedWords / queryWords.size();
+
+        // 3. 时间衰减（越近分数越高，简单实现）
+        long ageMs = System.currentTimeMillis() - entry.getTimestamp().toEpochMilli();
+        double ageHours = ageMs / (1000.0 * 60 * 60);
+        double timeDecay = Math.max(0.5, 1.0 - ageHours / 24.0); // 24小时内从1.0衰减到0.5
+
+        return keywordScore * timeDecay;
+    }
+
+    private static String expandLongTermQuery(String query) {
+        if (query == null || query.isBlank()) {
+            return query;
+        }
+        String compact = query.replaceAll("\\s+", "");
+        if (isUserIdentityQuery(compact)) {
+            return query + " 用户 名字 姓名 昵称 叫";
+        }
+        return query;
+    }
+
+    private static boolean isUserIdentityQuery(String query) {
+        return query.contains("我是谁")
+                || query.contains("我叫什么")
+                || query.contains("我叫啥")
+                || query.contains("我的名字")
+                || query.contains("我的姓名")
+                || query.contains("我的昵称")
+                || query.contains("记得我是谁")
+                || query.contains("知道我是谁");
+    }
+
+    private record ScoredEntry(MemoryEntry entry, double score, boolean fromShortTerm) {}
+}
